@@ -135,22 +135,16 @@ class TopologyBias(nn.Module):
         super().__init__()
         self.num_heads = num_heads
         self.num_classes = num_classes
-        self.cls_proj_q = nn.Linear(hidden_size, num_classes)
-        self.cls_proj_k = nn.Linear(hidden_size, num_classes)
-        in_dim_q = num_classes + 2
-        in_dim_k = num_classes + 2
+        # Eq. (3): both streams share the same semantic projection W_p.
+        self.cls_proj = nn.Linear(hidden_size, num_classes)
+        in_dim = num_classes + 2
         mid_dim = max(32, hidden_size // 8)
-        self.query_mlp = nn.Sequential(
-            nn.Linear(in_dim_q, mid_dim),
+        # Eq. (4): the spatial-semantic embedding MLP is shared as well.
+        self.embedding_mlp = nn.Sequential(
+            nn.Linear(in_dim, mid_dim),
             nn.GELU(),
             nn.Linear(mid_dim, num_heads)
         )
-        self.key_mlp = nn.Sequential(
-            nn.Linear(in_dim_k, mid_dim),
-            nn.GELU(),
-            nn.Linear(mid_dim, num_heads)
-        )
-        self.scale = nn.Parameter(torch.tensor(0.1))
         grid1 = _build_normalized_grid(feat_size1)
         grid2 = _build_normalized_grid(feat_size2)
         self.register_buffer('grid1', grid1)
@@ -160,8 +154,15 @@ class TopologyBias(nn.Module):
         B, nq, _ = embed_q.shape
         _, nk, _ = embed_k.shape
 
-        prob_q = torch.softmax(self.cls_proj_q(embed_q), dim=-1)
-        prob_k = torch.softmax(self.cls_proj_k(embed_k), dim=-1)
+        if nq != self.grid1.shape[0] or nk != self.grid2.shape[0]:
+            raise ValueError(
+                'Token counts must match the configured feature grids: '
+                f'got ({nq}, {nk}), expected '
+                f'({self.grid1.shape[0]}, {self.grid2.shape[0]}).'
+            )
+
+        prob_q = torch.softmax(self.cls_proj(embed_q), dim=-1)
+        prob_k = torch.softmax(self.cls_proj(embed_k), dim=-1)
 
         pos_q = self.grid1.unsqueeze(0).expand(B, nq, -1)
         pos_k = self.grid2.unsqueeze(0).expand(B, nk, -1)
@@ -169,14 +170,13 @@ class TopologyBias(nn.Module):
         q_feat = torch.cat([pos_q, prob_q], dim=-1)
         k_feat = torch.cat([pos_k, prob_k], dim=-1)
 
-        q_bias = self.query_mlp(q_feat).permute(0, 2, 1) 
-        k_bias = self.key_mlp(k_feat).permute(0, 2, 1)
+        embed_q_topo = self.embedding_mlp(q_feat)
+        embed_k_topo = self.embedding_mlp(k_feat)
 
-        q_bias = q_bias.unsqueeze(-1)
-        k_bias = k_bias.unsqueeze(-2)
-        bias = torch.matmul(q_bias, k_bias)
-        bias = torch.tanh(bias) * self.scale
-        return bias
+        # [B, N_q, H] x [B, N_k, H] -> [B, H, N_q, N_k].
+        # No additional scale is used, matching Eq. (4)-(5) in the paper.
+        bias = torch.einsum('bqh,bkh->bhqk', embed_q_topo, embed_k_topo)
+        return torch.tanh(bias)
 
 
 class Embeddings(nn.Module):
