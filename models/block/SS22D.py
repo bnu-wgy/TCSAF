@@ -1,6 +1,8 @@
+from typing import Callable, Dict, List, Optional, Tuple
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+
 try:
     from mamba_ssm import Mamba  # type: ignore
     HAS_MAMBA = True
@@ -9,124 +11,207 @@ except Exception:
         from mamba_ssm.torch import Mamba  # type: ignore
         HAS_MAMBA = True
     except Exception:
+        Mamba = None  # type: ignore
         HAS_MAMBA = False
 
 
-class Mamba2D(nn.Module):
-    def __init__(self, channels: int, d_state: int = 16, d_conv: int = 4, expand: int = 2):
+DIRECTION_NAMES = (
+    'horizontal_forward',
+    'horizontal_backward',
+    'vertical_forward',
+    'vertical_backward',
+    'main_diagonal_forward',
+    'main_diagonal_backward',
+    'anti_diagonal_forward',
+    'anti_diagonal_backward',
+)
+
+
+def _diagonal_order(height: int, width: int, anti: bool) -> List[int]:
+    """Return a permutation that follows complete image diagonals."""
+    order: List[int] = []
+
+    if anti:
+        # Traverse each anti-diagonal from upper-right to lower-left.
+        starts = [(0, col) for col in range(width)]
+        starts.extend((row, width - 1) for row in range(1, height))
+        for row, col in starts:
+            while row < height and col >= 0:
+                order.append(row * width + col)
+                row += 1
+                col -= 1
+    else:
+        # Traverse each main diagonal from upper-left to lower-right.
+        starts = [(0, col) for col in range(width - 1, -1, -1)]
+        starts.extend((row, 0) for row in range(1, height))
+        for row, col in starts:
+            while row < height and col < width:
+                order.append(row * width + col)
+                row += 1
+                col += 1
+
+    if len(order) != height * width or len(set(order)) != height * width:
+        raise RuntimeError('Diagonal scan construction did not cover each pixel once.')
+    return order
+
+
+class EightDirectionalSelectiveScan(nn.Module):
+    """Apply an SSM to eight spatial scan directions and remap to 2D."""
+
+    def __init__(
+        self,
+        channels: int,
+        d_state: int = 16,
+        d_conv: int = 4,
+        expand: int = 2,
+        ssm_factory: Optional[Callable[[], nn.Module]] = None,
+    ):
         super().__init__()
-        self.ln = nn.LayerNorm(channels)
-        self.mamba = Mamba(d_model=channels, d_state=d_state, d_conv=d_conv, expand=expand)
-        self.proj = nn.Conv2d(channels, channels, 1)
+        self.channels = channels
+
+        if ssm_factory is None:
+            if not HAS_MAMBA:
+                raise ImportError(
+                    'mamba_ssm is required for the eight-directional selective '
+                    'scan described in Eq. (7). Install mamba-ssm before '
+                    'constructing TCSAF.'
+                )
+
+            def ssm_factory() -> nn.Module:
+                return Mamba(  # type: ignore[misc]
+                    d_model=channels,
+                    d_state=d_state,
+                    d_conv=d_conv,
+                    expand=expand,
+                )
+
+        # Eq. (7) uses a direction-specific SSM_r for each scan route.
+        self.ssm_layers = nn.ModuleList(
+            [ssm_factory() for _ in DIRECTION_NAMES]
+        )
+        self.output_norm = nn.LayerNorm(channels)
+        self._scan_cache: Dict[
+            Tuple[int, int, str, Optional[int]],
+            List[Tuple[torch.Tensor, torch.Tensor]],
+        ] = {}
+
+    def _apply(self, fn):
+        # Cached permutations are device-specific and are not state buffers.
+        self._scan_cache.clear()
+        return super()._apply(fn)
+
+    def _scan_orders(
+        self,
+        height: int,
+        width: int,
+        device: torch.device,
+    ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+        cache_key = (height, width, device.type, device.index)
+        cached = self._scan_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        length = height * width
+        horizontal = torch.arange(length, device=device, dtype=torch.long)
+        vertical = horizontal.view(height, width).transpose(0, 1).reshape(-1)
+        main_diagonal = torch.tensor(
+            _diagonal_order(height, width, anti=False),
+            device=device,
+            dtype=torch.long,
+        )
+        anti_diagonal = torch.tensor(
+            _diagonal_order(height, width, anti=True),
+            device=device,
+            dtype=torch.long,
+        )
+
+        base_orders = (horizontal, vertical, main_diagonal, anti_diagonal)
+        orders: List[torch.Tensor] = []
+        for order in base_orders:
+            orders.append(order)
+            orders.append(torch.flip(order, dims=(0,)))
+
+        cached = [(order, torch.argsort(order)) for order in orders]
+        self._scan_cache[cache_key] = cached
+        return cached
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        b, c, h, w = x.shape
-        residual = x
-        x = x.permute(0, 2, 3, 1).contiguous().view(b, h * w, c)  # (B,L,C)
-        x = self.ln(x)
-        x = self.mamba(x)  # (B,L,C)
-        x = x.view(b, h, w, c).permute(0, 3, 1, 2).contiguous()  # (B,C,H,W)
-        x = self.proj(x)
-        return x + residual
+        if x.ndim != 4:
+            raise ValueError(f'Expected a BCHW tensor, got shape {tuple(x.shape)}.')
 
+        batch, channels, height, width = x.shape
+        if channels != self.channels:
+            raise ValueError(
+                f'Expected {self.channels} channels, got {channels} channels.'
+            )
 
-class _AxisGlobalMixer(nn.Module):
-    def __init__(self, channels: int):
-        super().__init__()
-        self.dw7 = nn.Conv2d(channels, channels, 7, padding=3, groups=channels, bias=False)
-        self.bn1 = nn.BatchNorm2d(channels)
-        self.pw1 = nn.Conv2d(channels, channels, 1, bias=False)
-        self.act1 = nn.GELU()
+        # Original 2D token order used as the common remapping target.
+        flat = x.permute(0, 2, 3, 1).contiguous().view(
+            batch, height * width, channels
+        )
 
-        self.dw_dil = nn.Conv2d(channels, channels, 5, padding=2*2, dilation=2, groups=channels, bias=False)
-        self.bn2 = nn.BatchNorm2d(channels)
-        self.pw2 = nn.Conv2d(channels, channels, 1, bias=False)
+        merged = None
+        for ssm, (order, inverse) in zip(
+            self.ssm_layers,
+            self._scan_orders(height, width, x.device),
+        ):
+            sequence = flat.index_select(1, order)
+            sequence = ssm(sequence)
+            if not isinstance(sequence, torch.Tensor) or sequence.shape != flat.shape:
+                raise RuntimeError(
+                    'Each directional SSM must return a tensor with shape '
+                    f'{tuple(flat.shape)}.'
+                )
+            remapped = sequence.index_select(1, inverse)
+            merged = remapped if merged is None else merged + remapped
 
-        squeeze = max(8, channels // 16)
-        self.se_avg = nn.AdaptiveAvgPool2d(1)
-        self.se_fc1 = nn.Conv2d(channels, squeeze, 1)
-        self.se_fc2 = nn.Conv2d(squeeze, channels, 1)
-        self.act2 = nn.GELU()
+        if merged is None:
+            raise RuntimeError('No directional SSM outputs were produced.')
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = x
-        x = self.dw7(x)
-        x = self.bn1(x)
-        x = self.pw1(x)
-        x = self.act1(x)
-
-        x = self.dw_dil(x)
-        x = self.bn2(x)
-        x = self.pw2(x)
-
-        w = self.se_avg(x)
-        w = self.se_fc1(w)
-        w = self.act2(w)
-        w = self.se_fc2(w).sigmoid()
-        x = x * w
-        return x + residual
-
-
-class _DiagonalMixer(nn.Module):
-
-    def __init__(self, channels: int):
-        super().__init__()
-        # 主对角（↘）
-        self.dw_tlbr = nn.Conv2d(channels, channels, 3, padding=1, groups=channels, bias=False)
-        # 副对角（↙）
-        self.dw_trbl = nn.Conv2d(channels, channels, 3, padding=1, groups=channels, bias=False)
-        self.bn = nn.BatchNorm2d(channels * 2)
-        self.act = nn.GELU()
-        self.proj = nn.Conv2d(channels * 2, channels, 1, bias=False)
-
-        # 初始化为对角模板（之后可学习微调）
-        with torch.no_grad():
-            k1 = torch.zeros(channels, 1, 3, 3)
-            k1[:, 0, 0, 0] = 1/3
-            k1[:, 0, 1, 1] = 1/3
-            k1[:, 0, 2, 2] = 1/3
-            self.dw_tlbr.weight.copy_(k1)
-
-            k2 = torch.zeros(channels, 1, 3, 3)
-            k2[:, 0, 0, 2] = 1/3
-            k2[:, 0, 1, 1] = 1/3
-            k2[:, 0, 2, 0] = 1/3
-            self.dw_trbl.weight.copy_(k2)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        a = self.dw_tlbr(x)
-        b = self.dw_trbl(x)
-        y = torch.cat([a, b], dim=1)
-        y = self.bn(y)
-        y = self.act(y)
-        y = self.proj(y)
-        return y
+        # Eq. (7): LN(sum_r Remap_r(SSM_r(Scan_r(F)))).
+        merged = self.output_norm(merged)
+        return merged.view(batch, height, width, channels).permute(
+            0, 3, 1, 2
+        ).contiguous()
 
 
 class SS22DBlock(nn.Module):
+    """Eight-directional SSM followed by the gated residual in Eq. (8)."""
 
-    def __init__(self, channels: int):
+    def __init__(
+        self,
+        channels: int,
+        d_state: int = 16,
+        d_conv: int = 4,
+        expand: int = 2,
+        ssm_factory: Optional[Callable[[], nn.Module]] = None,
+    ):
         super().__init__()
-        self.norm = nn.BatchNorm2d(channels)
-        if HAS_MAMBA:
-            self.axis_mixer = Mamba2D(channels)
-        else:
-            self.axis_mixer = _AxisGlobalMixer(channels)
-        self.diag_mixer = _DiagonalMixer(channels)
-
-        self.fuse = nn.Conv2d(channels * 2, channels, 1, bias=False)
-        self.fuse_bn = nn.BatchNorm2d(channels)
-        self.act = nn.GELU()
+        self.channels = channels
+        self.directional_scan = EightDirectionalSelectiveScan(
+            channels=channels,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+            ssm_factory=ssm_factory,
+        )
+        self.gate_norm = nn.LayerNorm(channels)
+        self.gate_projection = nn.Linear(channels, channels)
+        self.output_projection = nn.Linear(channels, channels)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = x
-        x = self.norm(x)
-        xa = self.axis_mixer(x)
-        xd = self.diag_mixer(x)
-        y = torch.cat([xa, xd], dim=1)
-        y = self.fuse(y)
-        y = self.fuse_bn(y)
-        y = self.act(y)
-        return y + residual
+        if x.ndim != 4:
+            raise ValueError(f'Expected a BCHW tensor, got shape {tuple(x.shape)}.')
+        if x.shape[1] != self.channels:
+            raise ValueError(
+                f'Expected {self.channels} channels, got {x.shape[1]} channels.'
+            )
 
+        feature_8d = self.directional_scan(x)
+        residual = x.permute(0, 2, 3, 1).contiguous()
+        feature_8d = feature_8d.permute(0, 2, 3, 1).contiguous()
 
+        # Eq. (8): Linear(F_8d * Linear(LN(F))) + F.
+        gate = self.gate_projection(self.gate_norm(residual))
+        output = self.output_projection(feature_8d * gate) + residual
+        return output.permute(0, 3, 1, 2).contiguous()
